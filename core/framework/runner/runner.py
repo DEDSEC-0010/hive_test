@@ -18,7 +18,9 @@ from framework.runner.tool_registry import ToolRegistry
 # Multi-entry-point runtime imports
 from framework.runtime.agent_runtime import AgentRuntime, create_agent_runtime
 from framework.runtime.core import Runtime
+from framework.runtime.event_bus import EventBus
 from framework.runtime.execution_stream import EntryPointSpec
+from framework.runtime.webhook import WebhookConfig, WebhookNotifier
 
 if TYPE_CHECKING:
     from framework.runner.protocol import AgentMessage, CapabilityResponse
@@ -286,6 +288,10 @@ class AgentRunner:
         self._agent_runtime: AgentRuntime | None = None
         self._uses_async_entry_points = self.graph.has_async_entry_points()
 
+        # Webhook notification support
+        self._event_bus: EventBus | None = None
+        self._webhook_notifier: WebhookNotifier | None = None
+
         # Auto-discover tools from tools.py
         tools_path = agent_path / "tools.py"
         if tools_path.exists():
@@ -540,14 +546,27 @@ class AgentRunner:
         # Create runtime
         self._runtime = Runtime(storage_path=self._storage_path)
 
-        # Create executor
+        # Create EventBus for webhook notifications
+        self._event_bus = EventBus()
+
+        # Create executor with EventBus for lifecycle events
         self._executor = GraphExecutor(
             runtime=self._runtime,
             llm=self._llm,
             tools=tools,
             tool_executor=tool_executor,
             approval_callback=self._approval_callback,
+            event_bus=self._event_bus,
         )
+
+        # Set up webhook notifier if configured
+        webhook_config = self._load_webhook_config()
+        if webhook_config:
+            self._webhook_notifier = WebhookNotifier(
+                event_bus=self._event_bus,
+                config=webhook_config,
+            )
+            logger.info(f"Webhook notifications enabled: {webhook_config.url}")
 
     def _setup_agent_runtime(self, tools: list, tool_executor: Callable | None) -> None:
         """Set up multi-entry-point execution using AgentRuntime."""
@@ -576,6 +595,48 @@ class AgentRunner:
             tools=tools,
             tool_executor=tool_executor,
         )
+
+        # Set up webhook notifier for multi-entry-point agents
+        webhook_config = self._load_webhook_config()
+        if webhook_config:
+            self._webhook_notifier = WebhookNotifier(
+                event_bus=self._agent_runtime.event_bus,
+                config=webhook_config,
+            )
+            logger.info(f"Webhook notifications enabled: {webhook_config.url}")
+
+    def _load_webhook_config(self) -> WebhookConfig | None:
+        """
+        Load webhook configuration from environment or agent.json.
+
+        Priority:
+        1. Environment variables (HIVE_WEBHOOK_URL)
+        2. agent.json webhook configuration
+
+        Returns:
+            WebhookConfig if configured, None otherwise
+        """
+        # Check environment first
+        config = WebhookConfig.from_env(agent_name=self.graph.id)
+        if config:
+            return config
+
+        # Check agent.json
+        agent_json_path = self.agent_path / "agent.json"
+        if agent_json_path.exists():
+            try:
+                with open(agent_json_path) as f:
+                    data = json.load(f)
+                webhook_data = data.get("webhook")
+                if webhook_data and isinstance(webhook_data, dict):
+                    # Add agent_name if not specified
+                    if "agent_name" not in webhook_data:
+                        webhook_data["agent_name"] = self.graph.id
+                    return WebhookConfig.from_dict(webhook_data)
+            except (json.JSONDecodeError, OSError, KeyError) as e:
+                logger.warning(f"Failed to load webhook config from agent.json: {e}")
+
+        return None
 
     async def run(
         self,
@@ -638,12 +699,22 @@ class AgentRunner:
         if self._executor is None:
             self._setup()
 
-        return await self._executor.execute(
-            graph=self.graph,
-            goal=self.goal,
-            input_data=input_data,
-            session_state=session_state,
-        )
+        # Start webhook notifier if configured
+        if self._webhook_notifier:
+            await self._webhook_notifier.start()
+
+        try:
+            result = await self._executor.execute(
+                graph=self.graph,
+                goal=self.goal,
+                input_data=input_data,
+                session_state=session_state,
+            )
+            return result
+        finally:
+            # Stop webhook notifier
+            if self._webhook_notifier:
+                await self._webhook_notifier.stop()
 
     async def _run_with_agent_runtime(
         self,
@@ -658,6 +729,10 @@ class AgentRunner:
         if not self._agent_runtime.is_running:
             await self._agent_runtime.start()
 
+        # Start webhook notifier if configured
+        if self._webhook_notifier:
+            await self._webhook_notifier.start()
+
         # Determine entry point
         if entry_point_id is None:
             # Use first entry point or "default" if no entry points defined
@@ -667,20 +742,25 @@ class AgentRunner:
             else:
                 entry_point_id = "default"
 
-        # Trigger and wait for result
-        result = await self._agent_runtime.trigger_and_wait(
-            entry_point_id=entry_point_id,
-            input_data=input_data,
-        )
-
-        # Return result or create error result
-        if result is not None:
-            return result
-        else:
-            return ExecutionResult(
-                success=False,
-                error="Execution timed out or failed to complete",
+        try:
+            # Trigger and wait for result
+            result = await self._agent_runtime.trigger_and_wait(
+                entry_point_id=entry_point_id,
+                input_data=input_data,
             )
+
+            # Return result or create error result
+            if result is not None:
+                return result
+            else:
+                return ExecutionResult(
+                    success=False,
+                    error="Execution timed out or failed to complete",
+                )
+        finally:
+            # Stop webhook notifier
+            if self._webhook_notifier:
+                await self._webhook_notifier.stop()
 
     # === Multi-Entry-Point API (for agents with async_entry_points) ===
 

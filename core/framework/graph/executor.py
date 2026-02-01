@@ -32,6 +32,14 @@ from framework.graph.validator import OutputValidator
 from framework.llm.provider import LLMProvider, Tool
 from framework.runtime.core import Runtime
 
+# Optional EventBus for lifecycle notifications
+try:
+    from framework.runtime.event_bus import AgentEvent, EventBus, EventType
+
+    EVENT_BUS_AVAILABLE = True
+except ImportError:
+    EVENT_BUS_AVAILABLE = False
+
 
 @dataclass
 class ExecutionResult:
@@ -124,6 +132,7 @@ class GraphExecutor:
         cleansing_config: CleansingConfig | None = None,
         enable_parallel_execution: bool = True,
         parallel_config: ParallelExecutionConfig | None = None,
+        event_bus: "EventBus | None" = None,
     ):
         """
         Initialize the executor.
@@ -138,6 +147,7 @@ class GraphExecutor:
             cleansing_config: Optional output cleansing configuration
             enable_parallel_execution: Enable parallel fan-out execution (default True)
             parallel_config: Configuration for parallel execution behavior
+            event_bus: Optional EventBus for lifecycle event notifications
         """
         self.runtime = runtime
         self.llm = llm
@@ -158,6 +168,10 @@ class GraphExecutor:
         # Parallel execution settings
         self.enable_parallel_execution = enable_parallel_execution
         self._parallel_config = parallel_config or ParallelExecutionConfig()
+
+        # Optional EventBus for lifecycle notifications (webhooks, etc.)
+        self._event_bus = event_bus
+        self._execution_id: str | None = None  # Track current execution
 
     def _validate_tools(self, graph: GraphSpec) -> list[str]:
         """
@@ -181,6 +195,65 @@ class GraphExecutor:
                     )
 
         return errors
+
+    async def _emit_started(
+        self,
+        stream_id: str,
+        execution_id: str,
+        input_data: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit EXECUTION_STARTED event if EventBus is available."""
+        if self._event_bus and EVENT_BUS_AVAILABLE:
+            await self._event_bus.emit_execution_started(
+                stream_id=stream_id,
+                execution_id=execution_id,
+                input_data=input_data,
+            )
+
+    async def _emit_completed(
+        self,
+        stream_id: str,
+        execution_id: str,
+        output: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit EXECUTION_COMPLETED event if EventBus is available."""
+        if self._event_bus and EVENT_BUS_AVAILABLE:
+            await self._event_bus.emit_execution_completed(
+                stream_id=stream_id,
+                execution_id=execution_id,
+                output=output,
+            )
+
+    async def _emit_failed(
+        self,
+        stream_id: str,
+        execution_id: str,
+        error: str,
+    ) -> None:
+        """Emit EXECUTION_FAILED event if EventBus is available."""
+        if self._event_bus and EVENT_BUS_AVAILABLE:
+            await self._event_bus.emit_execution_failed(
+                stream_id=stream_id,
+                execution_id=execution_id,
+                error=error,
+            )
+
+    async def _emit_paused(
+        self,
+        stream_id: str,
+        execution_id: str,
+        node_id: str,
+    ) -> None:
+        """Emit EXECUTION_PAUSED event if EventBus is available."""
+        if self._event_bus and EVENT_BUS_AVAILABLE:
+            await self._event_bus.publish(
+                AgentEvent(
+                    type=EventType.EXECUTION_PAUSED,
+                    stream_id=stream_id,
+                    execution_id=execution_id,
+                    data={"paused_at": node_id},
+                )
+            )
 
     async def execute(
         self,
@@ -263,6 +336,19 @@ class GraphExecutor:
             goal_id=goal.id,
             goal_description=goal.description,
             input_data=input_data or {},
+        )
+
+        # Track execution for events
+        import uuid
+
+        self._execution_id = str(uuid.uuid4())
+        stream_id = graph.id or "default"
+
+        # Emit EXECUTION_STARTED event for webhooks
+        await self._emit_started(
+            stream_id=stream_id,
+            execution_id=self._execution_id,
+            input_data=input_data,
         )
 
         self.logger.info(f"🚀 Starting execution: {goal.name}")
@@ -421,6 +507,17 @@ class GraphExecutor:
                         total_retries_count = sum(node_retry_counts.values())
                         nodes_failed = list(node_retry_counts.keys())
 
+                        # Emit EXECUTION_FAILED event for webhooks
+                        error_msg = (
+                            f"Node '{node_spec.name}' failed after "
+                            f"{max_retries} attempts: {result.error}"
+                        )
+                        await self._emit_failed(
+                            stream_id=stream_id,
+                            execution_id=self._execution_id or "",
+                            error=error_msg,
+                        )
+
                         return ExecutionResult(
                             success=False,
                             error=(
@@ -461,6 +558,13 @@ class GraphExecutor:
                     total_retries_count = sum(node_retry_counts.values())
                     nodes_failed = [nid for nid, count in node_retry_counts.items() if count > 0]
                     exec_quality = "degraded" if total_retries_count > 0 else "clean"
+
+                    # Emit EXECUTION_PAUSED event for webhooks
+                    await self._emit_paused(
+                        stream_id=stream_id,
+                        execution_id=self._execution_id or "",
+                        node_id=node_spec.id,
+                    )
 
                     return ExecutionResult(
                         success=True,
@@ -584,6 +688,13 @@ class GraphExecutor:
                 ),
             )
 
+            # Emit EXECUTION_COMPLETED event for webhooks
+            await self._emit_completed(
+                stream_id=stream_id,
+                execution_id=self._execution_id or "",
+                output=output,
+            )
+
             return ExecutionResult(
                 success=True,
                 output=output,
@@ -611,6 +722,13 @@ class GraphExecutor:
             # Calculate quality metrics even for exceptions
             total_retries_count = sum(node_retry_counts.values())
             nodes_failed = list(node_retry_counts.keys())
+
+            # Emit EXECUTION_FAILED event for webhooks
+            await self._emit_failed(
+                stream_id=stream_id,
+                execution_id=self._execution_id or "",
+                error=str(e),
+            )
 
             return ExecutionResult(
                 success=False,
