@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration system via `config.yaml`
 - GitHub Actions CI/CD workflows
 - Comprehensive documentation
+- core: Webhook notifications for agent lifecycle events (start, pause, complete, failure) - configurable via environment variables or agent.json (#3090)
 
 ### Changed
 - N/A
